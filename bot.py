@@ -275,7 +275,10 @@ class TaskProcessor:
         status = await message.reply(status_text)
         started = time.monotonic()
         try:
-            async with ChatActionSender.upload_document(bot=bot, chat_id=message.chat.id):
+            thread_id = message.message_thread_id if message.is_topic_message else None
+            async with ChatActionSender.upload_document(
+                bot=bot, chat_id=message.chat.id, message_thread_id=thread_id,
+            ):
                 media: list[MediaPart] = []
                 if media_ref is not None:
                     buffer = await bot.download(media_ref.file_id, destination=BytesIO())
