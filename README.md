@@ -1,0 +1,120 @@
+# 📐 Telegram-бот по высшей математике (LaTeX → PDF)
+
+Бот решает задачи по высшей математике и составляет структурированные конспекты,
+отвечая готовым PDF, собранным через `pdflatex`.
+
+- **Основной провайдер:** Google AI Studio (Gemini, по умолчанию `gemini-2.5-flash`) с нативной
+  мультимодальностью: фото и скриншоты задач, голосовые, аудиофайлы, PDF.
+- **Резервный провайдер:** OpenRouter (бесплатные рассуждающие модели). Текстовые запросы
+  переключаются на него автоматически при любой ошибке Gemini (429, 5xx, сеть, таймаут, пустой ответ).
+- **Самоисправление LaTeX:** если `pdflatex` падает, хвост лога уходит обратно в LLM, и сборка
+  повторяется до 2 раз. Если PDF всё равно не собрался, решение приходит текстом.
+- **Под Render Free (512 МБ):** не больше 2 тяжёлых задач одновременно, антиспам 1 запрос за 15 с,
+  урезанный TeX Live, healthcheck на `GET /`.
+
+## Структура
+
+| Файл | Назначение |
+|---|---|
+| `bot.py` | точка входа: aiogram 3 (polling) + aiohttp healthcheck на `$PORT` |
+| `llm_service.py` | Gemini (`google-genai`) + OpenRouter (`openai.AsyncOpenAI`), маршрутизация и fallback |
+| `pdf_builder.py` | очистка ответа, шаблон с кириллицей, `pdflatex` во временной папке, self-healing |
+| `Dockerfile` | `python:3.11-slim` + минимальный TeX Live |
+
+## Команды
+
+| Команда | Что делает |
+|---|---|
+| `/solve <задача>` | подробное решение, Gemini в режиме глубоких размышлений |
+| `/note <тема>` | конспект, быстрый режим |
+| `/or <запрос>` | принудительно через OpenRouter (только текст) |
+| `/help` | справка |
+
+**Личные сообщения:** бот обрабатывает любой текст, фото, голосовое, аудио или PDF.
+Фото по умолчанию считается задачей, аудио — лекцией для конспекта, а режим для текста
+определяется по ключевым словам.
+
+**Группы:** бот реагирует только на `/solve`, `/note`, `/or`, `/help`. Команду можно написать
+в подписи к фото или аудио, либо ответить ею на сообщение с фото или аудио.
+
+## Переменные окружения
+
+Скопируйте `.env.example` в `.env` и заполните:
+
+| Переменная | Обязательна | Описание |
+|---|---|---|
+| `TELEGRAM_TOKEN` | да | токен от @BotFather |
+| `GEMINI_API_KEY` | желательно | ключ Google AI Studio |
+| `OPENROUTER_API_KEY` | желательно | ключ OpenRouter |
+| `PRIMARY_GEMINI_MODEL` | нет | по умолчанию `gemini-2.5-flash` |
+| `OPENROUTER_FALLBACK_MODELS` | нет | модели через запятую, используются первые 3 |
+| `PORT` | нет | порт healthcheck, по умолчанию `10000` |
+
+Нужен хотя бы один из ключей `GEMINI_API_KEY` и `OPENROUTER_API_KEY`. Без Gemini бот работает
+только с текстом.
+
+> **Регион.** Gemini API недоступен в части стран (ответ `400 FAILED_PRECONDITION: User location
+> is not supported`). При локальном запуске из такой страны текстовые запросы автоматически уходят
+> в OpenRouter, а фото и аудио не обрабатываются. На Render (США, Франкфурт, Сингапур) Gemini работает.
+>
+> **Модели OpenRouter.** Бесплатные модели регулярно удаляются из каталога. При старте бот сверяет
+> `OPENROUTER_FALLBACK_MODELS` с каталогом и пропускает несуществующие. Если не осталось ни одной,
+> используется `openrouter/free`.
+
+## Локальный запуск
+
+### Вариант 1: Docker (рекомендуется, LaTeX уже внутри)
+
+```bash
+docker build -t tg-math-bot .
+docker run --rm --env-file .env -p 10000:10000 tg-math-bot
+```
+
+Проверка healthcheck: `curl http://localhost:10000/` должен вернуть `OK`.
+
+### Вариант 2: Python напрямую
+
+Нужен Python 3.11+ и установленный `pdflatex` (TeX Live или MiKTeX с пакетами
+`cyrillic`, `babel-russian`, `amsmath`, `mathtools`, `cm-super`).
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # Linux/macOS
+pip install -r requirements.txt
+python pdf_builder.py           # самопроверка LaTeX
+python bot.py
+```
+
+Без `pdflatex` бот всё равно работает, но отвечает текстом вместо PDF.
+
+## Деплой на Render.com (бесплатный тариф)
+
+1. Запушьте репозиторий на GitHub (файл `.env` в `.gitignore` и в репозиторий не попадёт).
+2. На Render: **New → Web Service** и подключите репозиторий.
+3. **Runtime:** Docker. **Instance Type:** Free.
+4. В **Environment** добавьте `TELEGRAM_TOKEN`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`
+   и при необходимости `PRIMARY_GEMINI_MODEL` и `OPENROUTER_FALLBACK_MODELS`.
+   `PORT` Render задаёт сам.
+5. **Health Check Path:** `/`.
+6. Нажмите **Deploy**. Во время сборки выполняется `python pdf_builder.py`: если TeX Live
+   собран неполностью, сборка упадёт сразу, а не в рабочем режиме.
+
+### Чтобы бесплатный сервис не засыпал
+
+Render Free усыпляет сервис после 15 минут без входящего HTTP-трафика.
+Создайте в [UptimeRobot](https://uptimerobot.com) монитор **HTTP(s)** на
+`https://<ваш-сервис>.onrender.com/` с интервалом 5 минут. Эндпоинт отвечает на `GET` и `HEAD`.
+
+### Замечания
+
+- При редеплое старый и новый инстансы недолго работают одновременно, и Telegram может вернуть
+  `Conflict: terminated by other getUpdates request`. aiogram сам переподключается, это нормально.
+- Бот работает через long polling, так что вебхук не нужен: при старте он удаляется автоматически.
+
+## Безопасность
+
+- `pdflatex` запускается с `-no-shell-escape` и `openin_any=p`, без переменных окружения
+  (ключи API ему недоступны).
+- Из LaTeX-ответа вырезаются `\input`, `\include`, `\write18`, `\openin` и подобные команды,
+  поэтому пользователь не сможет «попросить» модель вставить в PDF файлы с сервера.

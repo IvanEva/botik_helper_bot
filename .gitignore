@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# LaTeX artifacts
+*.pdf
+*.aux
+*.log
+*.out
+*.toc
+
+# IDE
+.idea/
+.vscode/
