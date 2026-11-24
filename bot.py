@@ -26,8 +26,10 @@ from aiogram.utils.chat_action import ChatActionSender
 from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 
+from access import AccessControl, AccessMiddleware, handle_bot_added, parse_ids
 from llm_service import (
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_OPENROUTER_MAX_TOKENS,
     DEFAULT_OPENROUTER_MODELS,
     LLMError,
     LLMResult,
@@ -53,6 +55,7 @@ HELP_TEXT = (
     "/solve &lt;задача&gt; — подробное решение (глубокое рассуждение)\n"
     "/note &lt;тема&gt; — структурированный конспект\n"
     "/or &lt;запрос&gt; — принудительно через OpenRouter (только текст)\n"
+    "/id — показать ваш ID и ID группы\n"
     "/help — эта справка\n\n"
     "<b>Вложения</b>\n"
     "• Фото/скрин задачи → решение\n"
@@ -110,9 +113,12 @@ class Settings:
     openrouter_api_key: str | None
     gemini_model: str
     openrouter_models: list[str]
+    openrouter_max_tokens: int
     port: int
     self_ping_url: str | None
     self_ping_interval: float
+    allowed_user_ids: set[int]
+    allowed_chat_ids: set[int]
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -128,10 +134,13 @@ class Settings:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip() or None,
             gemini_model=os.getenv("PRIMARY_GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL,
             openrouter_models=models,
+            openrouter_max_tokens=int(os.getenv("OPENROUTER_MAX_TOKENS", str(DEFAULT_OPENROUTER_MAX_TOKENS))),
             port=int(os.getenv("PORT", "10000")),
             # Render sets RENDER_EXTERNAL_URL automatically for web services.
             self_ping_url=(os.getenv("SELF_PING_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip() or None,
             self_ping_interval=float(os.getenv("SELF_PING_INTERVAL", "600")),
+            allowed_user_ids=parse_ids(os.getenv("ALLOWED_USER_IDS")),
+            allowed_chat_ids=parse_ids(os.getenv("ALLOWED_CHAT_IDS")),
         )
 
 
@@ -220,10 +229,15 @@ class TaskProcessor:
             return
 
         if force_openrouter and media_ref is not None:
-            if not text:
-                await message.reply("/or работает только с текстом. Для фото и аудио используйте /solve или /note.")
-                return
-            media_ref = None  # ignore attachment, use text only
+            images_ok = media_ref.kind == "image" and bool(self.llm.openrouter_vision_models)
+            if not images_ok:
+                if not text:
+                    await message.reply(
+                        "/or принимает текст и фото (если модель OpenRouter понимает изображения). "
+                        "Для аудио и PDF используйте /solve или /note."
+                    )
+                    return
+                media_ref = None  # ignore unsupported attachment, use text only
 
         if media_ref is not None and media_ref.size and media_ref.size > MAX_FILE_BYTES:
             await message.reply("Файл больше 20 МБ — Telegram не даёт ботам скачивать такие файлы.")
@@ -329,6 +343,18 @@ async def cmd_help(message: Message) -> None:
     await message.reply(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
+@router.message(Command("id"))
+async def cmd_id(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else "?"
+    text = f"Ваш ID: <code>{user_id}</code>"
+    if message.chat.type != ChatType.PRIVATE:
+        text += f"\nID этой группы: <code>{message.chat.id}</code>"
+    await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+router.my_chat_member.register(handle_bot_added)
+
+
 @router.message(Command("solve"))
 async def cmd_solve(message: Message, command: CommandObject, bot: Bot, processor: TaskProcessor) -> None:
     await processor.handle(message, bot, command.args, mode=Mode.SOLVE)
@@ -425,7 +451,8 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     settings = Settings.from_env()
     llm = LLMService(
@@ -433,6 +460,7 @@ async def main() -> None:
         openrouter_api_key=settings.openrouter_api_key,
         gemini_model=settings.gemini_model,
         openrouter_models=settings.openrouter_models,
+        openrouter_max_tokens=settings.openrouter_max_tokens,
     )
     logger.info(
         "Providers: Gemini=%s (%s), OpenRouter=%s %s",
@@ -440,8 +468,18 @@ async def main() -> None:
         bool(settings.openrouter_api_key), llm.openrouter_models,
     )
 
+    access = AccessControl(settings.allowed_user_ids, settings.allowed_chat_ids)
+    if access.enabled:
+        logger.info(
+            "Access restricted: owners=%s, groups=%s",
+            sorted(access.allowed_users), sorted(access.allowed_chats),
+        )
+    else:
+        logger.warning("Access is OPEN to everyone: set ALLOWED_USER_IDS / ALLOWED_CHAT_IDS to restrict")
+
     bot = Bot(token=settings.telegram_token)
-    dp = Dispatcher(processor=TaskProcessor(llm))
+    dp = Dispatcher(processor=TaskProcessor(llm), access=access)
+    dp.message.outer_middleware(AccessMiddleware(access))
     dp.include_router(router)
 
     # Start healthcheck first so Render sees an open port quickly.

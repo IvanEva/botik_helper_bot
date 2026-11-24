@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ DEFAULT_OPENROUTER_MODELS = [
     "openrouter/free",
 ]
 OPENROUTER_SAFE_DEFAULT = "openrouter/free"  # meta-router, always available
+DEFAULT_OPENROUTER_MAX_TOKENS = 24000
 # OpenRouter accepts a limited number of entries in the "models" routing list.
 OPENROUTER_MAX_MODELS = 3
 
@@ -136,7 +138,12 @@ class LLMService:
         openrouter_api_key: str | None,
         gemini_model: str = DEFAULT_GEMINI_MODEL,
         openrouter_models: list[str] | None = None,
+        openrouter_max_tokens: int = DEFAULT_OPENROUTER_MAX_TOKENS,
     ) -> None:
+        # Hard cap on output (reasoning included) per OpenRouter call — protects paid budgets.
+        self.openrouter_max_tokens = openrouter_max_tokens
+        # Filled by validate_openrouter_models() from the catalog.
+        self.openrouter_vision_models: list[str] = []
         self.gemini_model = gemini_model or DEFAULT_GEMINI_MODEL
         models = [m.strip() for m in (openrouter_models or DEFAULT_OPENROUTER_MODELS) if m.strip()]
         if len(models) > OPENROUTER_MAX_MODELS:
@@ -179,27 +186,39 @@ class LLMService:
         """Generate a LaTeX body for the given mode with automatic fallback."""
         media = media or []
         prompt = (prompt or "").strip() or DEFAULT_USER_PROMPT[mode]
+        openrouter_can_take_media = not media or self.openrouter_accepts(media)
 
         if force_openrouter:
-            if media:
-                raise LLMError("Команда /or работает только с текстом — вложения OpenRouter не принимает.")
-            return await self._openrouter_generate(mode, prompt)
+            if not openrouter_can_take_media:
+                raise LLMError(
+                    "Через /or можно отправить текст или фото (если модель OpenRouter понимает "
+                    "изображения). Аудио и PDF обрабатывает только Gemini: используйте /solve или /note."
+                )
+            return await self._openrouter_generate(mode, prompt, media)
 
         if self._gemini is not None:
             try:
                 return await self._gemini_generate(mode, prompt, media)
             except Exception as exc:  # noqa: BLE001 — any Gemini failure -> fallback
                 logger.warning("Gemini failed (%s): %s", _describe_error(exc), exc)
-                if media:
+                if not openrouter_can_take_media:
                     raise LLMError(
-                        "Gemini сейчас недоступен, а резервный провайдер не умеет работать "
-                        "с фото и аудио. Попробуйте позже или пришлите задачу текстом."
+                        "Gemini сейчас недоступен, а резервный провайдер не принимает такие вложения. "
+                        "Попробуйте позже или пришлите задачу текстом."
                     ) from exc
-        elif media:
-            raise LLMError("Обработка фото и аудио требует GEMINI_API_KEY.")
+        elif not openrouter_can_take_media:
+            raise LLMError("Обработка аудио и PDF требует GEMINI_API_KEY.")
 
-        logger.info("Falling back to OpenRouter (mode=%s)", mode.value)
-        return await self._openrouter_generate(mode, prompt)
+        logger.info("Falling back to OpenRouter (mode=%s, images=%d)", mode.value, len(media))
+        return await self._openrouter_generate(mode, prompt, media)
+
+    def openrouter_accepts(self, media: list[MediaPart]) -> bool:
+        """OpenRouter fallback handles images only, and only with vision-capable models."""
+        return (
+            self._openrouter is not None
+            and bool(self.openrouter_vision_models)
+            and all(m.mime_type.startswith("image/") for m in media)
+        )
 
     async def fix_latex(self, latex_body: str, error_log: str, prefer_openrouter: bool = False) -> str:
         prompt = (
@@ -221,10 +240,11 @@ class LLMService:
             return
         try:
             page = await self._openrouter.models.list()
-            available = {m.id for m in page.data}
+            catalog = {m.id: m for m in page.data}
         except Exception as exc:  # noqa: BLE001 — keep configured list if catalog is unreachable
             logger.warning("Could not fetch OpenRouter model catalog: %s", exc)
             return
+        available = set(catalog)
         valid = [m for m in self.openrouter_models if m in available]
         invalid = [m for m in self.openrouter_models if m not in available]
         if invalid:
@@ -233,7 +253,11 @@ class LLMService:
             valid = [OPENROUTER_SAFE_DEFAULT]
             logger.warning("No valid OpenRouter models configured, using %s", OPENROUTER_SAFE_DEFAULT)
         self.openrouter_models = valid
-        logger.info("OpenRouter fallback chain: %s", valid)
+        self.openrouter_vision_models = [m for m in valid if _accepts_images(catalog.get(m))]
+        logger.info(
+            "OpenRouter fallback chain: %s (image-capable: %s, max_tokens=%d)",
+            valid, self.openrouter_vision_models or "none", self.openrouter_max_tokens,
+        )
 
     async def close(self) -> None:
         if self._openrouter is not None:
@@ -292,22 +316,41 @@ class LLMService:
 
     # -------------------------------------------------------------- openrouter
 
-    async def _openrouter_generate(self, mode: Mode, prompt: str) -> LLMResult:
+    async def _openrouter_generate(
+        self, mode: Mode, prompt: str, media: list[MediaPart] | None = None,
+    ) -> LLMResult:
         if self._openrouter is None:
             raise LLMError("Резервный провайдер OpenRouter не настроен (нет OPENROUTER_API_KEY).")
 
+        media = media or []
+        # Image requests go only to models that accept images.
+        models = self.openrouter_vision_models if media else self.openrouter_models
+        if not models:
+            raise LLMError("Ни одна модель OpenRouter в списке не принимает изображения.")
+
+        user_content: str | list[dict] = prompt
+        if media:
+            user_content = [{"type": "text", "text": prompt}] + [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{m.mime_type};base64,{base64.b64encode(m.data).decode()}"},
+                }
+                for m in media
+            ]
+
         extra_body: dict = {
-            "models": self.openrouter_models,
+            "models": models,
             "reasoning": {"effort": "high" if mode is Mode.SOLVE else "low"},
         }
         try:
             response = await self._openrouter.chat.completions.create(
-                model=self.openrouter_models[0],
+                model=models[0],
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPTS[mode]},
-                    {"role": "user", "content": prompt},
+                    {"role": "user", "content": user_content},
                 ],
                 temperature=0.2,
+                max_tokens=self.openrouter_max_tokens,
                 extra_body=extra_body,
             )
         except (OpenAIError, asyncio.TimeoutError, OSError) as exc:
@@ -316,6 +359,8 @@ class LLMService:
 
         if not response.choices:
             raise LLMError("OpenRouter вернул пустой ответ. Попробуйте ещё раз.")
+        if response.choices[0].finish_reason == "length":
+            logger.warning("OpenRouter answer hit max_tokens=%d and may be truncated", self.openrouter_max_tokens)
         text = _strip_reasoning(response.choices[0].message.content or "")
         if not text:
             raise LLMError("OpenRouter вернул пустой ответ. Попробуйте ещё раз.")
@@ -323,6 +368,13 @@ class LLMService:
         used_model = response.model or self.openrouter_models[0]
         logger.info("OpenRouter ok: model=%s mode=%s usage=%s", used_model, mode.value, response.usage)
         return LLMResult(text=text, provider="OpenRouter", model=used_model)
+
+
+def _accepts_images(model: object | None) -> bool:
+    arch = getattr(model, "architecture", None) if model is not None else None
+    if not isinstance(arch, dict):
+        return False
+    return "image" in (arch.get("input_modalities") or [])
 
 
 def _describe_error(exc: BaseException) -> str:

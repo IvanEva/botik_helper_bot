@@ -30,7 +30,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --create-home --uid 1000 bot
-COPY --chown=bot:bot bot.py llm_service.py pdf_builder.py ./
+COPY --chown=bot:bot bot.py llm_service.py pdf_builder.py access.py ./
 USER bot
 
 # Fail the build early if the TeX installation cannot compile the template.
