@@ -8,6 +8,7 @@ Groups: only explicit commands (also as photo/audio caption or as a reply).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -22,7 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BufferedInputFile, Message
 from aiogram.utils.chat_action import ChatActionSender
-from aiohttp import web
+from aiohttp import ClientSession, ClientTimeout, web
 from dotenv import load_dotenv
 
 from llm_service import (
@@ -110,6 +111,8 @@ class Settings:
     gemini_model: str
     openrouter_models: list[str]
     port: int
+    self_ping_url: str | None
+    self_ping_interval: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,6 +129,9 @@ class Settings:
             gemini_model=os.getenv("PRIMARY_GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL,
             openrouter_models=models,
             port=int(os.getenv("PORT", "10000")),
+            # Render sets RENDER_EXTERNAL_URL automatically for web services.
+            self_ping_url=(os.getenv("SELF_PING_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip() or None,
+            self_ping_interval=float(os.getenv("SELF_PING_INTERVAL", "600")),
         )
 
 
@@ -379,6 +385,40 @@ async def start_health_server(port: int) -> web.AppRunner:
     return runner
 
 
+async def self_ping_loop(url: str, interval: float) -> None:
+    """Keep a Render free instance awake by hitting its own public URL.
+
+    Requests to the public ``*.onrender.com`` address pass through Render's
+    proxy and count as inbound traffic. This is a backup for an external
+    monitor (UptimeRobot): a sleeping instance cannot wake itself up.
+    """
+    target = url.rstrip("/") + "/health"
+    logger.info("Self-ping enabled: %s every %.0fs", target, interval)
+    timeout = ClientTimeout(total=30)
+    async with ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with session.get(target) as resp:
+                    if resp.status != 200:
+                        logger.warning("Self-ping got HTTP %s", resp.status)
+                    else:
+                        logger.debug("Self-ping OK")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — never let the pinger die
+                logger.warning("Self-ping failed: %s", exc)
+
+
+def start_self_ping(settings: "Settings") -> asyncio.Task | None:
+    if not settings.self_ping_url or settings.self_ping_interval <= 0:
+        logger.info("Self-ping disabled (no RENDER_EXTERNAL_URL / SELF_PING_URL, or SELF_PING_INTERVAL=0)")
+        return None
+    # Render sleeps after 15 min idle; keep the interval well below that.
+    interval = min(max(settings.self_ping_interval, 60.0), 840.0)
+    return asyncio.create_task(self_ping_loop(settings.self_ping_url, interval), name="self-ping")
+
+
 async def main() -> None:
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -406,11 +446,16 @@ async def main() -> None:
 
     # Start healthcheck first so Render sees an open port quickly.
     runner = await start_health_server(settings.port)
+    ping_task = start_self_ping(settings)
     try:
         await llm.validate_openrouter_models()
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if ping_task is not None:
+            ping_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ping_task
         await runner.cleanup()
         await llm.close()
         await bot.session.close()
