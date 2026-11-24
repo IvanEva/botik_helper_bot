@@ -28,7 +28,9 @@ from dotenv import load_dotenv
 
 from access import AccessControl, AccessMiddleware, handle_bot_added, parse_ids
 from llm_service import (
+    DEFAULT_GEMINI_FALLBACK_MODELS,
     DEFAULT_GEMINI_MODEL,
+    DEFAULT_GEMINI_TIME_BUDGET_S,
     DEFAULT_OPENROUTER_MAX_TOKENS,
     DEFAULT_OPENROUTER_MODELS,
     LLMError,
@@ -114,6 +116,8 @@ class Settings:
     gemini_model: str
     openrouter_models: list[str]
     openrouter_max_tokens: int
+    gemini_fallback_models: list[str]
+    gemini_time_budget_s: float
     port: int
     self_ping_url: str | None
     self_ping_interval: float
@@ -135,6 +139,10 @@ class Settings:
             gemini_model=os.getenv("PRIMARY_GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL,
             openrouter_models=models,
             openrouter_max_tokens=int(os.getenv("OPENROUTER_MAX_TOKENS", str(DEFAULT_OPENROUTER_MAX_TOKENS))),
+            gemini_fallback_models=[
+                m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()
+            ] or list(DEFAULT_GEMINI_FALLBACK_MODELS),
+            gemini_time_budget_s=float(os.getenv("GEMINI_TIME_BUDGET_S", str(DEFAULT_GEMINI_TIME_BUDGET_S))),
             port=int(os.getenv("PORT", "10000")),
             # Render sets RENDER_EXTERNAL_URL automatically for web services.
             self_ping_url=(os.getenv("SELF_PING_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip() or None,
@@ -454,7 +462,7 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
-    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
+    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "google_genai.models"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     settings = Settings.from_env()
@@ -464,6 +472,8 @@ async def main() -> None:
         gemini_model=settings.gemini_model,
         openrouter_models=settings.openrouter_models,
         openrouter_max_tokens=settings.openrouter_max_tokens,
+        gemini_fallback_models=settings.gemini_fallback_models,
+        gemini_time_budget_s=settings.gemini_time_budget_s,
     )
     logger.info(
         "Providers: Gemini=%s (%s), OpenRouter=%s %s",
@@ -489,6 +499,7 @@ async def main() -> None:
     runner = await start_health_server(settings.port)
     ping_task = start_self_ping(settings)
     try:
+        await llm.validate_gemini_models()
         await llm.validate_openrouter_models()
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
